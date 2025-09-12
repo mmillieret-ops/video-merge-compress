@@ -271,6 +271,12 @@ def compress_single(ffmpeg: str, ffprobe: str, payload: dict, params: dict):
             st.download_button("⬇️ Download MP4", f, file_name=params["out_name"], mime="video/mp4")
 
 def merge_and_compress(ffmpeg: str, ffprobe: str, payloads: list, params: dict):
+    """
+    Strategy:
+      A) Normalize both inputs -> concat demuxer (copy) -> final compress
+      B) Fallback if A fails: single filter-graph concat with re-encode (always works)
+    No exceptions escape (so the UI doesn't reset to 2%); errors are shown inline.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         # write inputs to disk
@@ -279,40 +285,146 @@ def merge_and_compress(ffmpeg: str, ffprobe: str, payloads: list, params: dict):
 
         log_area = st.empty(); pct_text = st.empty(); progress_bar = st.progress(0.0)
 
-        dur1 = ffprobe_duration(ffprobe, str(in1))
-        dur2 = ffprobe_duration(ffprobe, str(in2))
-        total_dur = dur1 + dur2
-        has_a1 = has_audio_stream(ffprobe, str(in1))
-        has_a2 = has_audio_stream(ffprobe, str(in2))
+        # probe inputs
+        try:
+            dur1 = ffprobe_duration(ffprobe, str(in1))
+            dur2 = ffprobe_duration(ffprobe, str(in2))
+            total_dur = dur1 + dur2
+            has_a1 = has_audio_stream(ffprobe, str(in1))
+            has_a2 = has_audio_stream(ffprobe, str(in2))
+        except Exception as e:
+            st.error(f"FFprobe failed: {e}")
+            return
 
-        # 1) Normalize both to identical intermediates (size/FPS/audio)
-        inter1 = tmpdir / "inter1.mp4"
-        inter2 = tmpdir / "inter2.mp4"
-        fps = 30  # unify FPS so concat is safe
-        make_intermediate(params["ffmpeg"], str(in1), str(inter1), params["max_height"], fps, params["audio_kbps"], has_a1, dur1, params["extra"], progress_bar, log_area, pct_text, 0.00, 0.30)
-        make_intermediate(params["ffmpeg"], str(in2), str(inter2), params["max_height"], fps, params["audio_kbps"], has_a2, dur2, params["extra"], progress_bar, log_area, pct_text, 0.30, 0.60)
+        # ---------- A) NORMALIZE → CONCAT DEMUXER → FINAL COMPRESS ----------
+        try:
+            inter1 = tmpdir / "inter1.mp4"
+            inter2 = tmpdir / "inter2.mp4"
+            fps = 30  # unify FPS so concat is safe
+            make_intermediate(params["ffmpeg"], str(in1), str(inter1), params["max_height"], fps, params["audio_kbps"], has_a1, dur1, params["extra"], progress_bar, log_area, pct_text, 0.00, 0.30)
+            make_intermediate(params["ffmpeg"], str(in2), str(inter2), params["max_height"], fps, params["audio_kbps"], has_a2, dur2, params["extra"], progress_bar, log_area, pct_text, 0.30, 0.60)
 
-        # 2) Concat intermediates (no re-encode)
-        listfile = tmpdir / "list.txt"
-        listfile.write_text(f"file '{inter1.as_posix()}'\nfile '{inter2.as_posix()}'\n", encoding="utf-8")
-        merged_pre = tmpdir / "merged_pre.mp4"
-        concat_intermediates(params["ffmpeg"], str(listfile), str(merged_pre), progress_bar, log_area, pct_text)
+            # concat without re-encode
+            listfile = tmpdir / "list.txt"
+            listfile.write_text(f"file '{inter1.as_posix()}'\nfile '{inter2.as_posix()}'\n", encoding="utf-8")
+            merged_pre = tmpdir / "merged_pre.mp4"
+            concat_intermediates(params["ffmpeg"], str(listfile), str(merged_pre), progress_bar, log_area, pct_text)
 
-        # 3) Final compress to target
-        final_path = tmpdir / params["out_name"]
-        vcodec = codec_name(params["codec"])
-        if "Size Cap" in params["encode_mode"]:
-            _, video_bps, _ = compute_bitrates(params["size_mb"], total_dur, params["audio_kbps"])
-            st.info(f"Total duration: **{total_dur:.1f}s** • Video: **{human_bitrate(video_bps)}** • Audio: **{params['audio_kbps']} kbps**")
-            final_encode_size_cap(params["ffmpeg"], str(merged_pre), str(final_path), vcodec, params["preset"], int(video_bps), params["audio_kbps"], total_dur, params["extra"], progress_bar, log_area, pct_text)
-        else:
-            st.info(f"CRF: **{params['crf']}** (lower = higher quality & bigger file)")
-            final_encode_crf(params["ffmpeg"], str(merged_pre), str(final_path), vcodec, params["preset"], params["crf"], params["audio_kbps"], total_dur, params["extra"], progress_bar, log_area, pct_text)
+            # final compress
+            final_path = tmpdir / params["out_name"]
+            vcodec = codec_name(params["codec"])
+            if "Size Cap" in params["encode_mode"]:
+                _, video_bps, _ = compute_bitrates(params["size_mb"], total_dur, params["audio_kbps"])
+                st.info(f"Total duration: **{total_dur:.1f}s** • Video: **{human_bitrate(video_bps)}** • Audio: **{params['audio_kbps']} kbps**")
+                final_encode_size_cap(params["ffmpeg"], str(merged_pre), str(final_path), vcodec, params["preset"], int(video_bps), params["audio_kbps"], total_dur, params["extra"], progress_bar, log_area, pct_text)
+            else:
+                st.info(f"CRF: **{params['crf']}** (lower = higher quality & bigger file)")
+                final_encode_crf(params["ffmpeg"], str(merged_pre), str(final_path), vcodec, params["preset"], params["crf"], params["audio_kbps"], total_dur, params["extra"], progress_bar, log_area, pct_text)
 
-        progress_bar.progress(1.0); pct_text.write("**100%**")
-        with open(final_path, "rb") as f:
-            st.success(f"Done! Output size: {final_path.stat().st_size/(1024*1024):.1f} MB")
-            st.download_button("⬇️ Download MP4", f, file_name=params["out_name"], mime="video/mp4")
+            progress_bar.progress(1.0); pct_text.write("**100%**")
+            with open(final_path, "rb") as f:
+                st.success(f"Done! Output size: {final_path.stat().st_size/(1024*1024):.1f} MB")
+                st.download_button("⬇️ Download MP4", f, file_name=params["out_name"], mime="video/mp4")
+            return
+        except Exception as e_a:
+            st.warning(f"Concat-demuxer path failed. Switching to safe re-encode merge. Details: {e_a}")
+
+        # ---------- B) FALLBACK: SINGLE FILTER-GRAPH CONCAT (RE-ENCODE) ----------
+        try:
+            H = int(params["max_height"])
+
+            def audio_node(idx, has_a, dur):
+                return (f"[{idx}:a]aresample=async=1:first_pts=0,"
+                        f"aformat=sample_rates=48000:channel_layouts=stereo,asetpts=N/SR/TB[a{idx}]") if has_a else \
+                       (f"anullsrc=cl=stereo:r=48000,atrim=0:{dur:.3f},asetpts=N/SR/TB[a{idx}]")
+
+            # VIDEO normalization (both)
+            v0 = f"[0:v]scale=-2:{H}:flags=lanczos,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v0]"
+            v1 = f"[1:v]scale=-2:{H}:flags=lanczos,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v1]"
+
+            # PASS 1: VIDEO-ONLY concat (a=0) to avoid unconnected audio
+            pass1_filter = ";".join([
+                v0, v1,
+                "[v0][v1]concat=n=2:v=1:a=0[v]"
+            ])
+
+            # FULL: VIDEO + AUDIO concat
+            a0 = audio_node(0, has_a1, dur1)
+            a1 = audio_node(1, has_a2, dur2)
+            full_filter = ";".join([
+                v0, v1, a0, a1,
+                "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
+            ])
+
+            final_path = tmpdir / params["out_name"]
+            vcodec = codec_name(params["codec"])
+
+            if "Size Cap" in params["encode_mode"]:
+                _, video_bps, _ = compute_bitrates(params["size_mb"], total_dur, params["audio_kbps"])
+                st.info(f"Total duration: **{total_dur:.1f}s** • Video: **{human_bitrate(video_bps)}** • Audio: **{params['audio_kbps']} kbps**")
+
+                passlog = str(final_path) + "_2passlog"
+
+                # Pass 1 (video only)
+                cmd1 = [
+                    params["ffmpeg"], "-y",
+                    "-i", str(in1), "-i", str(in2),
+                    "-filter_complex", pass1_filter,
+                    "-map", "[v]",
+                    "-c:v", vcodec, "-preset", params["preset"],
+                    "-b:v", str(int(video_bps)), "-maxrate", str(int(video_bps)), "-bufsize", str(int(video_bps*2)),
+                    "-pass", "1", "-passlogfile", passlog,
+                    "-an", "-f", "mp4", os.devnull
+                ] + (params["extra"] or [])
+
+                # Pass 2 (video + audio)
+                cmd2 = [
+                    params["ffmpeg"], "-y",
+                    "-i", str(in1), "-i", str(in2),
+                    "-filter_complex", full_filter,
+                    "-map", "[v]", "-map", "[a]",
+                    "-c:v", vcodec, "-preset", params["preset"],
+                    "-b:v", str(int(video_bps)), "-maxrate", str(int(video_bps)), "-bufsize", str(int(video_bps*2)),
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-c:a", "aac", "-b:a", f"{params['audio_kbps']}k",
+                    "-pass", "2", "-passlogfile", passlog,
+                    str(final_path)
+                ] + (params["extra"] or [])
+
+                run_with_progress(cmd1, total_dur, 0.00, 0.50, progress_bar, log_area, pct_text)
+                run_with_progress(cmd2, total_dur, 0.50, 1.00, progress_bar, log_area, pct_text)
+
+                for ext in (".log", "-0.log", "-0.log.mbtree", ".mbtree"):
+                    f = passlog + ext
+                    if os.path.exists(f):
+                        try: os.remove(f)
+                        except: pass
+
+            else:
+                # CRF single pass
+                st.info(f"CRF: **{params['crf']}** (lower = higher quality & bigger file)")
+                cmd = [
+                    params["ffmpeg"], "-y",
+                    "-i", str(in1), "-i", str(in2),
+                    "-filter_complex", full_filter,
+                    "-map", "[v]", "-map", "[a]",
+                    "-c:v", vcodec, "-preset", params["preset"], "-crf", str(params["crf"]),
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    "-c:a", "aac", "-b:a", f"{params['audio_kbps']}k",
+                    str(final_path)
+                ] + (params["extra"] or [])
+
+                run_with_progress(cmd, total_dur, 0.00, 1.00, progress_bar, log_area, pct_text)
+
+            progress_bar.progress(1.0); pct_text.write("**100%**")
+            with open(final_path, "rb") as f:
+                st.success(f"Done! Output size: {final_path.stat().st_size/(1024*1024):.1f} MB")
+                st.download_button("⬇️ Download MP4", f, file_name=params["out_name"], mime="video/mp4")
+            return
+
+        except Exception as e_b:
+            st.error(f"Fallback re-encode merge also failed: {e_b}")
+            return  # don't raise; avoids Streamlit rerun/reset
 
 # ===== UI =====
 if mode == "Compress 1 video":
