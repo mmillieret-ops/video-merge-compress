@@ -26,9 +26,17 @@ with st.sidebar:
     encode_mode = st.radio("Encoding mode", ["Size Cap (two-pass)", "CRF (quality target)"], index=0)
     codec = st.radio("Codec", ["H.264 (libx264)", "HEVC / H.265 (libx265)"], index=0)
     max_height = st.number_input("Max output height (px)", 144, 2160, 1080, 36)
-    preset = st.selectbox("Encoder preset (slower = better compression)",
-                          ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"], index=2)
+    preset_choice = st.selectbox("Encoder preset (slower = better compression)",
+                                 ["ultrafast","superfast","veryfast","faster","fast","medium","slow","slower","veryslow"], index=2)
     audio_kbps = st.slider("Audio bitrate (kbps)", 48, 320, 128, 16)
+
+    st.divider()
+    st.subheader("⚡ Speed profile")
+    speed_profile = st.selectbox(
+        "Prioritize speed vs quality",
+        ["Balanced (use preset above)", "Fast", "Turbo (fastest, more loss)"],
+        index=0
+    )
 
     st.divider()
     st.subheader("🔧 Advanced")
@@ -63,6 +71,21 @@ def ffprobe_duration(ffprobe: str, filename: str) -> float:
                 if d > dur: dur = d
             except: pass
     return dur
+
+def ffprobe_height_bitrate_codec(ffprobe: str, filename: str):
+    """Return (height, total_bps, vcodec, pix_fmt) best-effort."""
+    data = ffprobe_json(ffprobe, filename)
+    h = None; vcodec = None; pix_fmt = None
+    for s in data.get("streams", []):
+        if s.get("codec_type") == "video":
+            h = s.get("height", h)
+            vcodec = s.get("codec_name", vcodec)
+            pix_fmt = s.get("pix_fmt", pix_fmt)
+    try:
+        total_bps = float(data.get("format", {}).get("bit_rate", 0.0))
+    except:
+        total_bps = 0.0
+    return h or 0, total_bps or 0.0, (vcodec or "").lower(), (pix_fmt or "").lower()
 
 def has_audio_stream(ffprobe: str, filename: str) -> bool:
     data = ffprobe_json(ffprobe, filename)
@@ -110,14 +133,24 @@ def compute_bitrates(size_mb: float, total_duration: float, audio_kbps: int):
 def codec_name(label: str):
     return "libx264" if "H.264" in label else "libx265"
 
+def speed_params(profile: str, user_preset: str):
+    """Return (preset, scale_kernel, fps_cap, crf_bump)."""
+    if profile.startswith("Turbo"):
+        return ("ultrafast", "bilinear", 24, 3)
+    if profile.startswith("Fast"):
+        return ("veryfast", "bicubic", 30, 1)
+    # Balanced
+    return (user_preset, "lanczos", None, 0)
+
 # ---- Single-video filters: pass1 video-only (avoids aformat error), pass2/CRF full
-def single_filters(height: int, dur: float, has_audio: bool):
-    pass1 = f"[0:v]scale=-2:{height}:flags=lanczos[v]"  # VIDEO ONLY
+def single_filters(height: int, dur: float, has_audio: bool, scale_kernel: str, fps_cap: int|None):
+    fps_part = f",fps={fps_cap}" if fps_cap else ""
+    pass1 = f"[0:v]scale=-2:{height}:flags={scale_kernel}{fps_part}[v]"  # VIDEO ONLY
     if has_audio:
         a = "[0:a]aresample=async=1:first_pts=0,aformat=sample_rates=48000:channel_layouts=stereo[a]"
     else:
         a = f"anullsrc=cl=stereo:r=48000,atrim=0:{dur:.3f},asetpts=N/SR/TB[a]"
-    full = f"[0:v]scale=-2:{height}:flags=lanczos[v];{a}"
+    full = f"[0:v]scale=-2:{height}:flags={scale_kernel}{fps_part}[v];{a}"
     return pass1, full
 
 # ===== Encoders for single-video path =====
@@ -186,62 +219,6 @@ def encode_crf(ffmpeg: str, vcodec: str, audio_kbps: int, preset: str, crf: int,
     ] + (extra or [])
     run_with_progress(cmd, total_dur, 0.0, 1.0, progress_bar, log_area, pct_text)
 
-# ===== Robust merge helpers: normalize -> concat demuxer -> final compress =====
-def make_intermediate(ffmpeg: str, in_path: str, out_path: str, height: int, fps: int, audio_kbps: int, has_audio: bool, dur: float, extra: list, progress_bar, log_area, pct_text, seg_start: float, seg_end: float):
-    """Re-encode one clip to uniform size/FPS/audio so concat is safe."""
-    if has_audio:
-        fc = f"[0:v]scale=-2:{height}:flags=lanczos[v];[0:a]aresample=async=1:first_pts=0,aformat=sample_rates=48000:channel_layouts=stereo[a]"
-    else:
-        fc = f"[0:v]scale=-2:{height}:flags=lanczos[v];anullsrc=cl=stereo:r=48000,atrim=0:{dur:.3f},asetpts=N/SR/TB[a]"
-    cmd = [
-        ffmpeg, "-y",
-        "-i", in_path,
-        "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-r", str(fps), "-movflags", "+faststart",
-        "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-ar", "48000",
-        out_path
-    ] + (extra or [])
-    run_with_progress(cmd, dur, seg_start, seg_end, progress_bar, log_area, pct_text)
-
-def concat_intermediates(ffmpeg: str, list_file: str, out_path: str, progress_bar, log_area, pct_text):
-    cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", list_file, "-c", "copy", "-movflags", "+faststart", out_path]
-    # Concat is fast; map to a small progress slice
-    run_with_progress(cmd, 1.0, 0.60, 0.68, progress_bar, log_area, pct_text)
-
-def final_encode_size_cap(ffmpeg: str, in_path: str, out_path: str, vcodec: str, preset: str, video_bps: int, audio_kbps: int, total_dur: float, extra: list, progress_bar, log_area, pct_text):
-    passlog = str(Path(out_path).with_suffix("")) + "_2passlog"
-    # pass 1: video only
-    cmd1 = [ffmpeg, "-y", "-i", in_path,
-            "-map", "0:v:0",
-            "-c:v", vcodec, "-preset", preset,
-            "-b:v", str(int(video_bps)), "-maxrate", str(int(video_bps)), "-bufsize", str(int(video_bps*2)),
-            "-pass", "1", "-passlogfile", passlog, "-an", "-f", "mp4", os.devnull] + (extra or [])
-    # pass 2: video + audio
-    cmd2 = [ffmpeg, "-y", "-i", in_path,
-            "-map", "0:v:0", "-map", "0:a:0?",
-            "-c:v", vcodec, "-preset", preset,
-            "-b:v", str(int(video_bps)), "-maxrate", str(int(video_bps)), "-bufsize", str(int(video_bps*2)),
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            "-c:a", "aac", "-b:a", f"{audio_kbps}k",
-            "-pass", "2", "-passlogfile", passlog, out_path] + (extra or [])
-    run_with_progress(cmd1, total_dur, 0.68, 0.84, progress_bar, log_area, pct_text)
-    run_with_progress(cmd2, total_dur, 0.84, 1.00, progress_bar, log_area, pct_text)
-    for ext in (".log", "-0.log", "-0.log.mbtree", ".mbtree"):
-        f = passlog + ext
-        if os.path.exists(f):
-            try: os.remove(f)
-            except: pass
-
-def final_encode_crf(ffmpeg: str, in_path: str, out_path: str, vcodec: str, preset: str, crf: int, audio_kbps: int, total_dur: float, extra: list, progress_bar, log_area, pct_text):
-    cmd = [ffmpeg, "-y", "-i", in_path,
-           "-map", "0:v:0", "-map", "0:a:0?",
-           "-c:v", vcodec, "-preset", preset, "-crf", str(crf),
-           "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-           "-c:a", "aac", "-b:a", f"{audio_kbps}k",
-           out_path] + (extra or [])
-    run_with_progress(cmd, total_dur, 0.68, 1.00, progress_bar, log_area, pct_text)
-
 # ===== Pipelines =====
 def compress_single(ffmpeg: str, ffprobe: str, payload: dict, params: dict):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -250,19 +227,50 @@ def compress_single(ffmpeg: str, ffprobe: str, payload: dict, params: dict):
         out_path = tmpdir / params["out_name"]
 
         log_area = st.empty(); pct_text = st.empty(); progress_bar = st.progress(0.0)
-        dur = ffprobe_duration(ffprobe, str(in1)); has_a = has_audio_stream(ffprobe, str(in1))
+
+        dur = ffprobe_duration(ffprobe, str(in1))
+        has_a = has_audio_stream(ffprobe, str(in1))
+        in_h, in_total_bps, in_vcodec, in_pix = ffprobe_height_bitrate_codec(ffprobe, str(in1))
+
         vcodec = codec_name(params["codec"])
-        p1, full = single_filters(params["max_height"], dur, has_a)
+        preset = params["preset"]
+        scale_kernel = params["scale_kernel"]; fps_cap = params["fps_cap"]
+        p1, full = single_filters(params["max_height"], dur, has_a, scale_kernel, fps_cap)
         input_specs = ["-i", str(in1)]
 
+        # Fast path: stream copy if already small enough and no resize needed
+        if "Size Cap" in params["encode_mode"]:
+            target_total_bps, video_bps, _ = compute_bitrates(params["size_mb"], dur, params["audio_kbps"])
+            already_small = (in_total_bps > 0 and in_total_bps <= target_total_bps)
+            no_resize = (in_h <= params["max_height"])
+            codec_ok = (in_vcodec in ("h264","hevc")) and (in_pix in ("yuv420p","yuvj420p"))
+            if already_small and no_resize and codec_ok and not params["extra"]:
+                st.info("Fast path: input already under target and no resize needed — stream copying…")
+                cmd = [
+                    params["ffmpeg"], "-y",
+                    "-i", str(in1),
+                    "-map", "0",
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    str(out_path)
+                ]
+                run_with_progress(cmd, max(dur,1.0), 0.0, 1.0, progress_bar, log_area, pct_text)
+                progress_bar.progress(1.0); pct_text.write("**100%**")
+                with open(out_path, "rb") as f:
+                    st.success(f"Done (stream copy)! Output size: {out_path.stat().st_size/(1024*1024):.1f} MB")
+                    st.download_button("⬇️ Download MP4", f, file_name=params["out_name"], mime="video/mp4")
+                return
+
+        # Encode path
         if "Size Cap" in params["encode_mode"]:
             _, video_bps, _ = compute_bitrates(params["size_mb"], dur, params["audio_kbps"])
             st.info(f"Duration: **{dur:.1f}s** • Video: **{human_bitrate(video_bps)}** • Audio: **{params['audio_kbps']} kbps**")
-            encode_size_cap(params["ffmpeg"], vcodec, params["audio_kbps"], params["preset"], video_bps,
+            encode_size_cap(params["ffmpeg"], vcodec, params["audio_kbps"], preset, video_bps,
                             input_specs, p1, full, str(out_path), dur, params["extra"], progress_bar, log_area, pct_text)
         else:
-            st.info(f"CRF: **{params['crf']}** (lower = higher quality & bigger file)")
-            encode_crf(params["ffmpeg"], vcodec, params["audio_kbps"], params["preset"], params["crf"],
+            eff_crf = max(0, min(51, params["crf"] + params["crf_bump"]))
+            st.info(f"CRF: **{eff_crf}** (lower = higher quality & bigger file)")
+            encode_crf(params["ffmpeg"], vcodec, params["audio_kbps"], preset, eff_crf,
                        input_specs, full, str(out_path), dur, params["extra"], progress_bar, log_area, pct_text)
 
         progress_bar.progress(1.0); pct_text.write("**100%**")
@@ -272,20 +280,17 @@ def compress_single(ffmpeg: str, ffprobe: str, payload: dict, params: dict):
 
 def merge_and_compress(ffmpeg: str, ffprobe: str, payloads: list, params: dict):
     """
-    Strategy:
-      A) Normalize both inputs -> concat demuxer (copy) -> final compress
-      B) Fallback if A fails: single filter-graph concat with re-encode (always works)
-    No exceptions escape (so the UI doesn't reset); errors are shown inline.
+    SINGLE-PASS MERGE: build one filter graph that normalizes both clips (scale/fps/audio),
+    concat them, then encode once (two-pass for Size Cap, or single-pass CRF).
+    This is much faster than pre-encoding intermediates.
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
-        # write inputs to disk
         in1 = tmpdir / payloads[0]["name"]; in1.write_bytes(payloads[0]["data"])
         in2 = tmpdir / payloads[1]["name"]; in2.write_bytes(payloads[1]["data"])
 
         log_area = st.empty(); pct_text = st.empty(); progress_bar = st.progress(0.0)
 
-        # probe inputs
         try:
             dur1 = ffprobe_duration(ffprobe, str(in1))
             dur2 = ffprobe_duration(ffprobe, str(in2))
@@ -296,135 +301,86 @@ def merge_and_compress(ffmpeg: str, ffprobe: str, payloads: list, params: dict):
             st.error(f"FFprobe failed: {e}")
             return
 
-        # ---------- A) NORMALIZE → CONCAT DEMUXER → FINAL COMPRESS ----------
-        try:
-            inter1 = tmpdir / "inter1.mp4"
-            inter2 = tmpdir / "inter2.mp4"
-            fps = 30  # unify FPS so concat is safe
-            make_intermediate(params["ffmpeg"], str(in1), str(inter1), params["max_height"], fps, params["audio_kbps"], has_a1, dur1, params["extra"], progress_bar, log_area, pct_text, 0.00, 0.30)
-            make_intermediate(params["ffmpeg"], str(in2), str(inter2), params["max_height"], fps, params["audio_kbps"], has_a2, dur2, params["extra"], progress_bar, log_area, pct_text, 0.30, 0.60)
+        H = int(params["max_height"])
+        scale_kernel = params["scale_kernel"]; fps_cap = params["fps_cap"]
+        fps_part = f",fps={fps_cap}" if fps_cap else ""
 
-            # concat without re-encode
-            listfile = tmpdir / "list.txt"
-            listfile.write_text(f"file '{inter1.as_posix()}'\nfile '{inter2.as_posix()}'\n", encoding="utf-8")
-            merged_pre = tmpdir / "merged_pre.mp4"
-            concat_intermediates(params["ffmpeg"], str(listfile), str(merged_pre), progress_bar, log_area, pct_text)
+        def audio_node(idx, has_a, dur):
+            return (f"[{idx}:a]aresample=async=1:first_pts=0,"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo,asetpts=N/SR/TB[a{idx}]") if has_a else \
+                   (f"anullsrc=cl=stereo:r=48000,atrim=0:{dur:.3f},asetpts=N/SR/TB[a{idx}]")
 
-            # final compress
-            final_path = tmpdir / params["out_name"]
-            vcodec = codec_name(params["codec"])
-            if "Size Cap" in params["encode_mode"]:
-                _, video_bps, _ = compute_bitrates(params["size_mb"], total_dur, params["audio_kbps"])
-                st.info(f"Total duration: **{total_dur:.1f}s** • Video: **{human_bitrate(video_bps)}** • Audio: **{params['audio_kbps']} kbps**")
-                final_encode_size_cap(params["ffmpeg"], str(merged_pre), str(final_path), vcodec, params["preset"], int(video_bps), params["audio_kbps"], total_dur, params["extra"], progress_bar, log_area, pct_text)
-            else:
-                st.info(f"CRF: **{params['crf']}** (lower = higher quality & bigger file)")
-                final_encode_crf(params["ffmpeg"], str(merged_pre), str(final_path), vcodec, params["preset"], params["crf"], params["audio_kbps"], total_dur, params["extra"], progress_bar, log_area, pct_text)
+        # Normalize both videos (scale + optional fps cap + format)
+        v0 = f"[0:v]scale=-2:{H}:flags={scale_kernel}{fps_part},format=yuv420p,setpts=PTS-STARTPTS[v0]"
+        v1 = f"[1:v]scale=-2:{H}:flags={scale_kernel}{fps_part},format=yuv420p,setpts=PTS-STARTPTS[v1]"
+        a0 = audio_node(0, has_a1, dur1)
+        a1 = audio_node(1, has_a2, dur2)
 
-            progress_bar.progress(1.0); pct_text.write("**100%**")
-            with open(final_path, "rb") as f:
-                st.success(f"Done! Output size: {final_path.stat().st_size/(1024*1024):.1f} MB")
-                st.download_button("⬇️ Download MP4", f, file_name=params["out_name"], mime="video/mp4")
-            return
-        except Exception as e_a:
-            st.warning(f"Concat-demuxer path failed. Switching to safe re-encode merge. Details: {e_a}")
+        # Two graphs: pass1 video-only (a=0) and full (a=1)
+        pass1_filter = ";".join([v0, v1, "[v0][v1]concat=n=2:v=1:a=0[v]"])
+        full_filter  = ";".join([v0, v1, a0, a1, "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"])
 
-        # ---------- B) FALLBACK: SINGLE FILTER-GRAPH CONCAT (RE-ENCODE) ----------
-        try:
-            H = int(params["max_height"])
+        final_path = tmpdir / params["out_name"]
+        vcodec = codec_name(params["codec"])
+        preset = params["preset"]
 
-            def audio_node(idx, has_a, dur):
-                return (f"[{idx}:a]aresample=async=1:first_pts=0,"
-                        f"aformat=sample_rates=48000:channel_layouts=stereo,asetpts=N/SR/TB[a{idx}]") if has_a else \
-                       (f"anullsrc=cl=stereo:r=48000,atrim=0:{dur:.3f},asetpts=N/SR/TB[a{idx}]")
+        if "Size Cap" in params["encode_mode"]:
+            _, video_bps, _ = compute_bitrates(params["size_mb"], total_dur, params["audio_kbps"])
+            st.info(f"Total duration: **{total_dur:.1f}s** • Video: **{human_bitrate(video_bps)}** • Audio: **{params['audio_kbps']} kbps**")
+            passlog = str(final_path) + "_2passlog"
 
-            # VIDEO normalization (both)
-            v0 = f"[0:v]scale=-2:{H}:flags=lanczos,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v0]"
-            v1 = f"[1:v]scale=-2:{H}:flags=lanczos,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v1]"
+            # Pass 1 (video only)
+            cmd1 = [
+                params["ffmpeg"], "-y",
+                "-i", str(in1), "-i", str(in2),
+                "-filter_complex", pass1_filter,
+                "-map", "[v]",
+                "-c:v", vcodec, "-preset", preset,
+                "-b:v", str(int(video_bps)), "-maxrate", str(int(video_bps)), "-bufsize", str(int(video_bps*2)),
+                "-pass", "1", "-passlogfile", passlog,
+                "-an", "-f", "mp4", os.devnull
+            ] + (params["extra"] or [])
+            # Pass 2 (video + audio)
+            cmd2 = [
+                params["ffmpeg"], "-y",
+                "-i", str(in1), "-i", str(in2),
+                "-filter_complex", full_filter,
+                "-map", "[v]", "-map", "[a]",
+                "-c:v", vcodec, "-preset", preset,
+                "-b:v", str(int(video_bps)), "-maxrate", str(int(video_bps)), "-bufsize", str(int(video_bps*2)),
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-c:a", "aac", "-b:a", f"{params['audio_kbps']}k",
+                "-pass", "2", "-passlogfile", passlog,
+                str(final_path)
+            ] + (params["extra"] or [])
+            run_with_progress(cmd1, total_dur, 0.00, 0.50, progress_bar, log_area, pct_text)
+            run_with_progress(cmd2, total_dur, 0.50, 1.00, progress_bar, log_area, pct_text)
 
-            # PASS 1: VIDEO-ONLY concat (a=0) to avoid unconnected audio
-            pass1_filter = ";".join([
-                v0, v1,
-                "[v0][v1]concat=n=2:v=1:a=0[v]"
-            ])
+            for ext in (".log", "-0.log", "-0.log.mbtree", ".mbtree"):
+                f = passlog + ext
+                if os.path.exists(f):
+                    try: os.remove(f)
+                    except: pass
 
-            # FULL: VIDEO + AUDIO concat
-            a0 = audio_node(0, has_a1, dur1)
-            a1 = audio_node(1, has_a2, dur2)
-            full_filter = ";".join([
-                v0, v1, a0, a1,
-                "[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
-            ])
+        else:
+            eff_crf = max(0, min(51, params["crf"] + params["crf_bump"]))
+            st.info(f"CRF: **{eff_crf}** (lower = higher quality & bigger file)")
+            cmd = [
+                params["ffmpeg"], "-y",
+                "-i", str(in1), "-i", str(in2),
+                "-filter_complex", full_filter,
+                "-map", "[v]", "-map", "[a]",
+                "-c:v", vcodec, "-preset", preset, "-crf", str(eff_crf),
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-c:a", "aac", "-b:a", f"{params['audio_kbps']}k",
+                str(final_path)
+            ] + (params["extra"] or [])
+            run_with_progress(cmd, total_dur, 0.00, 1.00, progress_bar, log_area, pct_text)
 
-            final_path = tmpdir / params["out_name"]
-            vcodec = codec_name(params["codec"])
-
-            if "Size Cap" in params["encode_mode"]:
-                _, video_bps, _ = compute_bitrates(params["size_mb"], total_dur, params["audio_kbps"])
-                st.info(f"Total duration: **{total_dur:.1f}s** • Video: **{human_bitrate(video_bps)}** • Audio: **{params['audio_kbps']} kbps**")
-
-                passlog = str(final_path) + "_2passlog"
-
-                # Pass 1 (video only)
-                cmd1 = [
-                    params["ffmpeg"], "-y",
-                    "-i", str(in1), "-i", str(in2),
-                    "-filter_complex", pass1_filter,
-                    "-map", "[v]",
-                    "-c:v", vcodec, "-preset", params["preset"],
-                    "-b:v", str(int(video_bps)), "-maxrate", str(int(video_bps)), "-bufsize", str(int(video_bps*2)),
-                    "-pass", "1", "-passlogfile", passlog,
-                    "-an", "-f", "mp4", os.devnull
-                ] + (params["extra"] or [])
-
-                # Pass 2 (video + audio)
-                cmd2 = [
-                    params["ffmpeg"], "-y",
-                    "-i", str(in1), "-i", str(in2),
-                    "-filter_complex", full_filter,
-                    "-map", "[v]", "-map", "[a]",
-                    "-c:v", vcodec, "-preset", params["preset"],
-                    "-b:v", str(int(video_bps)), "-maxrate", str(int(video_bps)), "-bufsize", str(int(video_bps*2)),
-                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                    "-c:a", "aac", "-b:a", f"{params['audio_kbps']}k",
-                    "-pass", "2", "-passlogfile", passlog,
-                    str(final_path)
-                ] + (params["extra"] or [])
-
-                run_with_progress(cmd1, total_dur, 0.00, 0.50, progress_bar, log_area, pct_text)
-                run_with_progress(cmd2, total_dur, 0.50, 1.00, progress_bar, log_area, pct_text)
-
-                for ext in (".log", "-0.log", "-0.log.mbtree", ".mbtree"):
-                    f = passlog + ext
-                    if os.path.exists(f):
-                        try: os.remove(f)
-                        except: pass
-
-            else:
-                # CRF single pass
-                st.info(f"CRF: **{params['crf']}** (lower = higher quality & bigger file)")
-                cmd = [
-                    params["ffmpeg"], "-y",
-                    "-i", str(in1), "-i", str(in2),
-                    "-filter_complex", full_filter,
-                    "-map", "[v]", "-map", "[a]",
-                    "-c:v", vcodec, "-preset", params["preset"], "-crf", str(params["crf"]),
-                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                    "-c:a", "aac", "-b:a", f"{params['audio_kbps']}k",
-                    str(final_path)
-                ] + (params["extra"] or [])
-
-                run_with_progress(cmd, total_dur, 0.00, 1.00, progress_bar, log_area, pct_text)
-
-            progress_bar.progress(1.0); pct_text.write("**100%**")
-            with open(final_path, "rb") as f:
-                st.success(f"Done! Output size: {final_path.stat().st_size/(1024*1024):.1f} MB")
-                st.download_button("⬇️ Download MP4", f, file_name=params["out_name"], mime="video/mp4")
-            return
-
-        except Exception as e_b:
-            st.error(f"Fallback re-encode merge also failed: {e_b}")
-            return  # don't raise; avoids Streamlit rerun/reset
+        progress_bar.progress(1.0); pct_text.write("**100%**")
+        with open(final_path, "rb") as f:
+            st.success(f"Done! Output size: {final_path.stat().st_size/(1024*1024):.1f} MB")
+            st.download_button("⬇️ Download MP4", f, file_name=params["out_name"], mime="video/mp4")
 
 # ===== UI =====
 if mode == "Compress 1 video":
@@ -440,6 +396,9 @@ if mode == "Compress 1 video":
     crf = st.slider("CRF (18–28 typical) — only for CRF", 0, 51, 23)
     out_name = st.text_input("Output filename", value="compressed.mp4")
 
+    # Map speed profile to real params
+    preset_eff, scale_kernel, fps_cap, crf_bump = speed_params(speed_profile, preset_choice)
+
     if not st.session_state["busy_single"]:
         if st.button("▶️ Start", type="primary", disabled=(up is None)):
             if up is None:
@@ -448,8 +407,10 @@ if mode == "Compress 1 video":
                 st.session_state["single_payload"] = {"name": up.name, "data": up.getvalue()}
                 st.session_state["run_params"] = {
                     "encode_mode": encode_mode, "codec": codec, "max_height": int(max_height),
-                    "preset": preset, "audio_kbps": int(audio_kbps), "size_mb": float(size_mb),
-                    "crf": int(crf), "out_name": out_name,
+                    "preset": preset_eff, "audio_kbps": int(audio_kbps), "size_mb": float(size_mb),
+                    "crf": int(crf), "crf_bump": int(crf_bump),
+                    "scale_kernel": scale_kernel, "fps_cap": fps_cap,
+                    "out_name": out_name,
                     "ffmpeg": which_or(custom_ffmpeg, "ffmpeg"),
                     "extra": extra_flags.strip().split() if extra_flags.strip() else []
                 }
@@ -472,7 +433,7 @@ if mode == "Compress 1 video":
             st.session_state["run_params"] = None
 
 else:
-    # ==== MERGE path wrapped in a FORM; submit is ALWAYS enabled ====
+    # ==== MERGE path in a FORM; submit is ALWAYS enabled ====
     with st.form("merge_form", clear_on_submit=False):
         st.markdown("**Step 1. Choose order explicitly**")
         col1, col2 = st.columns(2)
@@ -502,10 +463,11 @@ else:
         crf = st.slider("CRF (18–28 typical) — only for CRF", 0, 51, 23, key="merge_crf")
         out_name = st.text_input("Output filename", value="merged.mp4", key="merge_out")
 
-        # IMPORTANT: keep enabled; validate after submit.
+        # Map speed profile here too
+        preset_eff, scale_kernel, fps_cap, crf_bump = speed_params(speed_profile, preset_choice)
+
         submitted = st.form_submit_button("▶️ Start", type="primary")
 
-    # After submit
     if submitted:
         if (up1 is None) or (up2 is None):
             st.warning("Please upload both files (First + Second) before pressing Start.")
@@ -516,15 +478,16 @@ else:
             ]
             st.session_state["run_params"] = {
                 "encode_mode": encode_mode, "codec": codec, "max_height": int(max_height),
-                "preset": preset, "audio_kbps": int(audio_kbps), "size_mb": float(size_mb),
-                "crf": int(crf), "out_name": out_name,
+                "preset": preset_eff, "audio_kbps": int(audio_kbps), "size_mb": float(size_mb),
+                "crf": int(crf), "crf_bump": int(crf_bump),
+                "scale_kernel": scale_kernel, "fps_cap": fps_cap,
+                "out_name": out_name,
                 "ffmpeg": which_or(custom_ffmpeg, "ffmpeg"),
                 "extra": extra_flags.strip().split() if extra_flags.strip() else []
             }
             st.session_state["busy_merge"] = True
             st.rerun()
 
-    # Processing phase
     if st.session_state["busy_merge"]:
         st.button("Processing…", disabled=True)
         try:
