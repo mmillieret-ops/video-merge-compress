@@ -467,38 +467,26 @@ if mode == "Compress 1 video":
             st.session_state["run_params"] = None
 
 else:
-    st.markdown("**Step 1. Choose order explicitly**")
-    col1, col2 = st.columns(2)
-    with col1:
-        up1 = st.file_uploader("First video", accept_multiple_files=False, type=None, key="merge_first")
-    with col2:
-        up2 = st.file_uploader("Second video", accept_multiple_files=False, type=None, key="merge_second")
+    # ==== MERGE path wrapped in a FORM to keep uploads stable ====
+    with st.form("merge_form", clear_on_submit=False):
+        st.markdown("**Step 1. Choose order explicitly**")
+        col1, col2 = st.columns(2)
+        with col1:
+            up1 = st.file_uploader("First video", accept_multiple_files=False, type=None, key="merge_first")
+        with col2:
+            up2 = st.file_uploader("Second video", accept_multiple_files=False, type=None, key="merge_second")
 
-    st.markdown("**Step 2.** Choose your output strategy below.")
-    size_mb = st.number_input("Target size (MB) — only for Size Cap", 10.0, 10000.0, 250.0, 10.0)
-    crf = st.slider("CRF (18–28 typical) — only for CRF", 0, 51, 23)
-    out_name = st.text_input("Output filename", value="merged.mp4")
+        st.caption(f"First: {'✅' if up1 else '❌'}  |  Second: {'✅' if up2 else '❌'}")
 
-    if not st.session_state["busy_merge"]:
-        disabled = (up1 is None or up2 is None)
-        if st.button("▶️ Start", type="primary", disabled=disabled):
-            if disabled:
-                st.warning("Please upload both files (First + Second).")
-            else:
-                st.session_state["merge_payload"] = [
-                    {"name": up1.name, "data": up1.getvalue()},
-                    {"name": up2.name, "data": up2.getvalue()},
-                ]
-                st.session_state["run_params"] = {
-                    "encode_mode": encode_mode, "codec": codec, "max_height": int(max_height),
-                    "preset": preset, "audio_kbps": int(audio_kbps), "size_mb": float(size_mb),
-                    "crf": int(crf), "out_name": out_name,
-                    "ffmpeg": which_or(custom_ffmpeg, "ffmpeg"),
-                    "extra": extra_flags.strip().split() if extra_flags.strip() else []
-                }
-                st.session_state["busy_merge"] = True
-                st.rerun()
-    else:
+        st.markdown("**Step 2.** Choose your output strategy below.")
+        size_mb = st.number_input("Target size (MB) — only for Size Cap", 10.0, 10000.0, 250.0, 10.0, key="merge_size")
+        crf = st.slider("CRF (18–28 typical) — only for CRF", 0, 51, 23, key="merge_crf")
+        out_name = st.text_input("Output filename", value="merged.mp4", key="merge_out")
+
+        files_ok = (up1 is not None and up2 is not None)
+        submitted = st.form_submit_button("▶️ Start", type="primary", disabled=not files_ok)
+
+    if st.session_state["busy_merge"]:
         st.button("Processing…", disabled=True)
         try:
             ffprobe = which_or(custom_ffprobe, "ffprobe")
@@ -513,3 +501,19 @@ else:
             st.session_state["busy_merge"] = False
             st.session_state["merge_payload"] = None
             st.session_state["run_params"] = None
+    elif submitted and files_ok:
+        st.session_state["merge_payload"] = [
+            {"name": up1.name, "data": up1.getvalue()},
+            {"name": up2.name, "data": up2.getvalue()},
+        ]
+        st.session_state["run_params"] = {
+            "encode_mode": encode_mode, "codec": codec, "max_height": int(max_height),
+            "preset": preset, "audio_kbps": int(audio_kbps), "size_mb": float(size_mb),
+            "crf": int(crf), "out_name": out_name,
+            "ffmpeg": which_or(custom_ffmpeg, "ffmpeg"),
+            "extra": extra_flags.strip().split() if extra_flags.strip() else []
+        }
+        st.session_state["busy_merge"] = True
+        st.rerun()
+    elif not files_ok:
+        st.info("Upload both the **First** and **Second** video to enable Start.")
